@@ -381,6 +381,11 @@ def load_channel_config() -> dict:
         data.setdefault("last_source_timestamp", None)
         if not isinstance(data.get("auto_signal_history"), list):
             data["auto_signal_history"] = []
+        if not isinstance(data.get("auto_result_history"), list):
+            # This is deliberately separate from bot signal history.  Pattern
+            # mode must read the actual game outcomes, not the directions the
+            # bot happened to post.
+            data["auto_result_history"] = []
         return data
     except Exception as error:
         logger.warning("Could not read auto-post configuration: %s", error)
@@ -389,6 +394,7 @@ def load_channel_config() -> dict:
             "auto_post": False,
             "last_source_timestamp": None,
             "auto_signal_history": [],
+            "auto_result_history": [],
         }
 
 
@@ -662,18 +668,15 @@ def _last_side_streak(sequence=None) -> tuple[str, int]:
 
 
 def _pattern_sequence(sequence=None, invert: bool = False) -> list[str]:
-    """Return the sequence used by the 3x recovery pattern.
+    """Return actual BIG/SMALL results for the recovery pattern.
 
-    In recovery mode the auto-post signal is already the losing side.  The
-    opposite side is therefore the inferred correct/result side used for the
-    pattern calculation: bot SSB -> corrected BBS.
+    New callers pass auto_result_history, which is recorded when each
+    auto-post is settled against the next game's result.  ``invert`` remains
+    available only for compatibility with older direct callers; production
+    pattern mode no longer guesses results by inverting bot signals.
     """
     if sequence is None:
-        sequence = [
-            x.get("signal")
-            for x in load_source_history()
-            if x.get("signal") in {"BIG", "SMALL"}
-        ]
+        sequence = load_channel_config().get("auto_result_history") or []
     values = [
         item.get("signal") if isinstance(item, dict) else item
         for item in sequence
@@ -1406,8 +1409,8 @@ async def generate_signal(txn_no: str) -> str | None:
     # Channel auto-post နဲ့ တူညီအောင် — 3x ရှုံးနေချိန် (pattern mode) မှာ
     # တောင်းလို့ရတဲ့ signal ကိုပါ pattern rule နဲ့ ပေးပါတယ်။
     if pattern_mode_active():
-        auto_history = load_channel_config().get("auto_signal_history") or None
-        pattern_output = pattern_predict(auto_history, invert=True)
+        result_history = load_channel_config().get("auto_result_history") or None
+        pattern_output = pattern_predict(result_history)
         if pattern_output:
             logger.info("Manual pattern mode (%s loss streak) → %s", mm_loss_streak(), pattern_output)
             return pattern_output
@@ -1651,6 +1654,35 @@ async def _send_text_retry(bot, chat_id: int, text: str, **kwargs):
             await asyncio.sleep(attempt * 2)
 
 
+def _actual_result_for_auto_pending(
+    pending: dict,
+    channel_level: int,
+) -> str | None:
+    """Resolve the actual BIG/SMALL game result for one auto-post.
+
+    The source channel's ``(N)`` label tells us whether the source channel's
+    prediction won.  Recover the source direction from the mode we posted and
+    then convert that win/loss into the actual game side.
+    """
+    if channel_level < 1:
+        return None
+    posted_signal = pending.get("signal")
+    if posted_signal not in {"BIG", "SMALL"}:
+        return None
+    source_signal = pending.get("source_signal")
+    if source_signal not in {"BIG", "SMALL"}:
+        mode = pending.get("mode", "source")
+        source_signal = (
+            posted_signal
+            if mode == "source"
+            else ("SMALL" if posted_signal == "BIG" else "BIG")
+        )
+    source_won = channel_level == 1
+    return source_signal if source_won else (
+        "SMALL" if source_signal == "BIG" else "BIG"
+    )
+
+
 async def _settle_auto_pending(bot, config: dict, channel_level: int | None) -> bool:
     """Use the NEW post's own (N) ladder label to read the SOURCE channel's
     outcome: (1) means the source's previous signal WON, any higher number
@@ -1659,14 +1691,48 @@ async def _settle_auto_pending(bot, config: dict, channel_level: int | None) -> 
     flipped whenever our pending signal was posted in "reverse" mode.
     Returns True if a pending signal was actually settled."""
     pending = config.get("auto_pending")
-    if not isinstance(pending, dict) or not pending.get("transaction") or not channel_level:
+    if not isinstance(pending, dict) or not pending.get("transaction"):
         return False
+
+    # Prefer the game's own result endpoint.  The source channel level is only
+    # a fallback because it describes whether the source prediction won; it
+    # is not itself the BIG/SMALL game result.
+    actual_result, actual_number = await fetch_game_result(
+        str(pending.get("transaction"))
+    )
+    if actual_result:
+        our_won = pending.get("signal") == actual_result
+        logger.info(
+            "Game result read for %s: %s%s",
+            pending.get("transaction"),
+            actual_result,
+            f" ({actual_number})" if actual_number else "",
+        )
+    else:
+        if not channel_level:
+            logger.warning(
+                "No game result available yet for %s; keeping auto signal pending",
+                pending.get("transaction"),
+            )
+            return False
+        actual_result = _actual_result_for_auto_pending(pending, int(channel_level))
+        our_won = (
+            actual_result is not None
+            and pending.get("signal") == actual_result
+        )
+
+    if actual_result:
+        result_history = [
+            item
+            for item in (config.get("auto_result_history") or [])
+            if isinstance(item, str) and item in {"BIG", "SMALL"}
+        ]
+        result_history.append(actual_result)
+        config["auto_result_history"] = result_history[-120:]
+        logger.info("Auto game result recorded: %s", actual_result)
 
     config["auto_pending"] = None
     save_channel_config(config)
-
-    source_won = channel_level == 1
-    our_won = source_won if pending.get("mode", "source") == "source" else (not source_won)
 
     if our_won:
         streak = mm_register_win()
@@ -1746,6 +1812,10 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE):
     # was actually posted in.
     await _settle_auto_pending(context.bot, config, channel_level)
     config = load_channel_config()
+    # Never overwrite a pending signal when neither the direct game-result
+    # endpoint nor the source fallback could settle it yet.
+    if config.get("auto_pending"):
+        return
 
     # Win 30 ရောက်သွားရင် အဲဒီ post အပြီး နောက် signal မပို့ရပါ။
     # ဒီ re-check မရှိရင် settle လုပ်ပြီးတဲ့အချိန်မှာ signal တစ်ခု ပိုပို့သွားပါတယ်။
@@ -1755,9 +1825,9 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE):
     # 3 ခါ ဆက်တိုက် ရှုံးရင် (3x) ပုံမှန် reverse/source turn ကို ခဏပြောင်းပြီး
     # bot ထုတ်ထားတဲ့ signal sequence အပေါ် pattern rule နဲ့ ပေးပါတယ်။
     # တစ်ခါ win တာနဲ့ နဂို turn ကို ပြန်သွားပါတယ်။
-    auto_history = config.get("auto_signal_history") or None
+    result_history = config.get("auto_result_history") or None
     pattern_output = (
-        pattern_predict(auto_history, invert=True)
+        pattern_predict(result_history)
         if pattern_mode_active() else None
     )
     if pattern_output:
@@ -1779,6 +1849,7 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE):
     config["auto_pending"] = {
         "transaction": transaction,
         "signal": output,
+        "source_signal": source_signal,
         "mode": mode,
         "amount": amount,
         "sent_at": datetime.now(timezone.utc).isoformat(),
