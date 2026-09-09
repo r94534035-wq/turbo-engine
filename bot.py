@@ -690,24 +690,20 @@ def _pattern_sequence(sequence=None, invert: bool = False) -> list[str]:
 
 def pattern_predict(sequence=None, *, invert: bool = False) -> str | None:
     """Pattern mode rule (အသစ်):
-    ကြီး ၁ခါ → ကြီး, ကြီး ၂ခါ → ကြီး, ကြီး ၃ခါ → သေး, ကြီး ၄ခါနှင့်အထက် → ကြီး
-    သေး ၁ခါ → သေး, သေး ၂ခါ → သေး, သေး ၃ခါ → ကြီး, သေး ၄ခါနှင့်အထက် → သေး
-    SBSB → ကြီး, BSBS → ကြီး
+    ကြီး ၂ခါ → ကြီး, ကြီး ၃ခါ → သေး, ကြီး ၄ခါနှင့်အထက် → ကြီး
+    သေး ၂ခါ → သေး, သေး ၃ခါ → ကြီး, သေး ၄ခါနှင့်အထက် → သေး
+    SB → ကြီး, BS → ကြီး
     """
     seq = _pattern_sequence(sequence, invert=invert)
     last, count = _last_side_streak(seq)
     if not last:
         return None
-    # နောက်ဆုံး ၄ ခုက အလ alternating (SBSB / BSBS) ဆိုရင် ကြီး
-    if len(seq) >= 4:
-        tail4 = seq[-4:]
-        if tail4 in (["SMALL", "BIG", "SMALL", "BIG"],
-                     ["BIG", "SMALL", "BIG", "SMALL"]):
-            return "BIG"
-    if last == "BIG":
-        return "SMALL" if count == 3 else "BIG"
-    # SMALL side
-    return "BIG" if count == 3 else "SMALL"
+    # SB / BS (နောက်ဆုံး ၂ ခု မတူ) ဆိုရင် ကြီး
+    if count == 1 and len(seq) >= 2:
+        return "BIG"
+    if count == 3:
+        return "SMALL" if last == "BIG" else "BIG"
+    return last
 
 
 def load_win_stickers() -> list:
