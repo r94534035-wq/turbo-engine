@@ -81,8 +81,6 @@ WIN_CYCLE_TARGET = int(os.getenv("WIN_CYCLE_TARGET", "30") or 30)
 CYCLE_HOUR_CHOICES = [1, 2, 3]
 # 3 ခါ ဆက်တိုက် ရှုံးရင် (3x) နောက် signal ကနေ pattern mode ပြောင်းသုံးပါတယ်။
 PATTERN_LOSS_TRIGGER = 3
-# Result မရလို့ pending က ဒီမိနစ်ထက် ကြာသွားရင် ဖျက်ပြီး signal ဆက်ပို့ပါတယ်။
-AUTO_PENDING_STALE_MIN = float(os.getenv("AUTO_PENDING_STALE_MIN", "10") or 10)
 DEFAULT_CYCLE_HOURS = 1
 MYANMAR_TZ = ZoneInfo("Asia/Rangoon")
 # Admin can choose the requested daily start/close times.  Keep both 12 AM
@@ -692,20 +690,24 @@ def _pattern_sequence(sequence=None, invert: bool = False) -> list[str]:
 
 def pattern_predict(sequence=None, *, invert: bool = False) -> str | None:
     """Pattern mode rule (အသစ်):
-    ကြီး ၂ခါ → ကြီး, ကြီး ၃ခါ → သေး, ကြီး ၄ခါနှင့်အထက် → ကြီး
-    သေး ၂ခါ → သေး, သေး ၃ခါ → ကြီး, သေး ၄ခါနှင့်အထက် → သေး
-    SB → ကြီး, BS → ကြီး
+    ကြီး ၁ခါ → ကြီး, ကြီး ၂ခါ → ကြီး, ကြီး ၃ခါ → သေး, ကြီး ၄ခါနှင့်အထက် → ကြီး
+    သေး ၁ခါ → သေး, သေး ၂ခါ → သေး, သေး ၃ခါ → ကြီး, သေး ၄ခါနှင့်အထက် → သေး
+    SBSB → ကြီး, BSBS → ကြီး
     """
     seq = _pattern_sequence(sequence, invert=invert)
     last, count = _last_side_streak(seq)
     if not last:
         return None
-    # SB / BS (နောက်ဆုံး ၂ ခု မတူ) ဆိုရင် ကြီး
-    if count == 1 and len(seq) >= 2:
-        return "BIG"
-    if count == 3:
-        return "SMALL" if last == "BIG" else "BIG"
-    return last
+    # နောက်ဆုံး ၄ ခုက အလ alternating (SBSB / BSBS) ဆိုရင် ကြီး
+    if len(seq) >= 4:
+        tail4 = seq[-4:]
+        if tail4 in (["SMALL", "BIG", "SMALL", "BIG"],
+                     ["BIG", "SMALL", "BIG", "SMALL"]):
+            return "BIG"
+    if last == "BIG":
+        return "SMALL" if count == 3 else "BIG"
+    # SMALL side
+    return "BIG" if count == 3 else "SMALL"
 
 
 def load_win_stickers() -> list:
@@ -1815,31 +1817,8 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE):
     config = load_channel_config()
     # Never overwrite a pending signal when neither the direct game-result
     # endpoint nor the source fallback could settle it yet.
-    # ဒါပေမဲ့ result အရမ်းကြာလို့ မရရင် pending က ထိပ်တန်းမှာ ကပ်ပြီး
-    # signal အသစ် ထွက်မလာဘဲ ရပ်နေတာကို ရှောင်ရန် အချိန်ကုန်ရင် ဖျက်ပါတယ်။
-    pending = config.get("auto_pending")
-    if pending:
-        stale = True
-        sent_at = pending.get("sent_at") if isinstance(pending, dict) else None
-        if sent_at:
-            try:
-                sent_time = datetime.fromisoformat(sent_at)
-                if sent_time.tzinfo is None:
-                    sent_time = sent_time.replace(tzinfo=timezone.utc)
-                age_minutes = (
-                    datetime.now(timezone.utc) - sent_time
-                ).total_seconds() / 60
-                stale = age_minutes >= AUTO_PENDING_STALE_MIN
-            except Exception:
-                stale = True
-        if not stale:
-            return
-        logger.warning(
-            "Auto pending %s was stuck without a result; clearing it so new signals can post",
-            pending.get("transaction") if isinstance(pending, dict) else pending,
-        )
-        config["auto_pending"] = None
-        save_channel_config(config)
+    if config.get("auto_pending"):
+        return
 
     # Win 30 ရောက်သွားရင် အဲဒီ post အပြီး နောက် signal မပို့ရပါ။
     # ဒီ re-check မရှိရင် settle လုပ်ပြီးတဲ့အချိန်မှာ signal တစ်ခု ပိုပို့သွားပါတယ်။
