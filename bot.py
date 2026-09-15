@@ -689,38 +689,27 @@ def _pattern_sequence(sequence=None, invert: bool = False) -> list[str]:
 
 
 def _pattern_predict_raw(sequence=None, *, invert: bool = False) -> str | None:
-    """Pattern mode rule မူရင်း (flip မလုပ်ခင်):
-    ကြီး ၁ခါ → ကြီး, ကြီး ၂ခါ → ကြီး, ကြီး ၃ခါ → သေး, ကြီး ၄ခါနှင့်အထက် → ကြီး
-    သေး ၁ခါ → သေး, သေး ၂ခါ → သေး, သေး ၃ခါ → ကြီး, သေး ၄ခါနှင့်အထက် → သေး
-    SBSB → ကြီး, BSBS → ကြီး
+    """Pattern rule (နောက်ဆုံး source results ကို ကြည့်၍):
+    ကြီး ၂ခါ → သေး, ကြီး ၃ခါ → ကြီး, ကြီး ၄ခါနှင့်အထက် → သေး
+    သေး ၂ခါ → ကြီး, သေး ၃ခါ → သေး, သေး ၄ခါနှင့်အထက် → ကြီး
+    SB (သေး→ကြီး) → သေး, BS (ကြီး→သေး) → သေး
     """
     seq = _pattern_sequence(sequence, invert=invert)
     last, count = _last_side_streak(seq)
     if not last:
         return None
-    # နောက်ဆုံး ၄ ခုက အလ alternating (SBSB / BSBS) ဆိုရင် ကြီး
-    if len(seq) >= 4:
-        tail4 = seq[-4:]
-        if tail4 in (["SMALL", "BIG", "SMALL", "BIG"],
-                     ["BIG", "SMALL", "BIG", "SMALL"]):
-            return "BIG"
+    # SB / BS — နောက်ဆုံး ၂ ခု အပြောင်းအလဲ ဆိုရင် အမြဲ သေး
+    if count == 1:
+        return "SMALL"
     if last == "BIG":
-        return "SMALL" if count == 3 else "BIG"
+        return "BIG" if count == 3 else "SMALL"
     # SMALL side
-    return "BIG" if count == 3 else "SMALL"
+    return "SMALL" if count == 3 else "BIG"
 
 
 def pattern_predict(sequence=None, *, invert: bool = False) -> str | None:
-    """Pattern rule ရလဒ်ကို လေပြန် (inverted) ပေးပါတယ်။
-
-    ဥပမာ — pattern အရ SMALL ပေးရမယ်ဆို BIG ပေး၊ BIG ပေးရမယ်ဆို SMALL ပေး။
-    """
-    raw = _pattern_predict_raw(sequence, invert=invert)
-    if raw == "BIG":
-        return "SMALL"
-    if raw == "SMALL":
-        return "BIG"
-    return None
+    """Pattern rule ရလဒ်ကို တိုက်ရိုက် ပြန်ပေးပါတယ်။"""
+    return _pattern_predict_raw(sequence, invert=invert)
 
 
 def load_win_stickers() -> list:
@@ -1751,6 +1740,9 @@ async def _settle_auto_pending(bot, config: dict, channel_level: int | None) -> 
     save_channel_config(config)
 
     if our_won:
+        # Win ဖြစ်တာနဲ့ flow အစ (ဒဲ့တစ်ခါ → ကန့်တစ်ခါ) ကို ချက်ချင်း ပြန်သွားပါတယ်။
+        config["auto_next_mode"] = "source"
+        save_channel_config(config)
         streak = mm_register_win()
         file_id = sticker_for_streak(streak)
         if file_id:
@@ -1791,6 +1783,19 @@ async def _send_auto_intro(bot, targets) -> None:
             )
         except Exception as error:
             logger.warning("Auto intro post failed for %s: %s", chat_id, error)
+
+
+def _auto_next_mode(config: dict) -> str:
+    """Auto post ရဲ့ သီးသန့် turn state — ဒဲ့ (source) တစ်ခါ၊ ကန့် (reverse) တစ်ခါ။
+
+    Manual signal တွေက ဒီ turn ကို မထိပါဘူး။ Win တာနဲ့ "source" ကို ပြန်ရောက်ပါတယ်။
+    """
+    mode = config.get("auto_next_mode")
+    if mode not in {"source", "reverse"}:
+        mode = "source"
+    config["auto_next_mode"] = "reverse" if mode == "source" else "source"
+    save_channel_config(config)
+    return mode
 
 
 async def auto_post_job(context: ContextTypes.DEFAULT_TYPE):
@@ -1852,7 +1857,8 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE):
         logger.info("Pattern mode (%s loss streak) → %s", mm_loss_streak(), output)
     else:
         # Consume one turn only for a genuinely new source post.
-        mode = _next_signal_mode()
+        mode = _auto_next_mode(config)
+        config = load_channel_config()
         output = (
             ("SMALL" if source_signal == "BIG" else "BIG")
             if mode == "reverse" else source_signal
@@ -2498,6 +2504,9 @@ async def _handle_admin_cb(q, ctx: ContextTypes.DEFAULT_TYPE, data: str):
         config["auto_post"] = not config.get("auto_post", False)
         # Auto post ကို အသစ်ပြန်ဖွင့်တိုင်း intro ပုံကို တစ်ကြိမ် ပြန်တင်ပါတယ်။
         config["auto_intro_sent"] = False
+        if config["auto_post"]:
+            # Session အသစ် — ဒဲ့ (source) ကနေ ပြန်စပါတယ်။
+            config["auto_next_mode"] = "source"
         save_channel_config(config)
         await q.edit_message_text(
             admin_panel_text(), parse_mode=ParseMode.MARKDOWN, reply_markup=kb_admin()
