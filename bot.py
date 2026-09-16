@@ -688,28 +688,26 @@ def _pattern_sequence(sequence=None, invert: bool = False) -> list[str]:
     return values
 
 
-def _pattern_predict_raw(sequence=None, *, invert: bool = False) -> str | None:
-    """Pattern rule (နောက်ဆုံး source results ကို ကြည့်၍):
-    ကြီး ၂ခါ → သေး, ကြီး ၃ခါ → ကြီး, ကြီး ၄ခါနှင့်အထက် → သေး
-    သေး ၂ခါ → ကြီး, သေး ၃ခါ → သေး, သေး ၄ခါနှင့်အထက် → ကြီး
-    SB (သေး→ကြီး) → သေး, BS (ကြီး→သေး) → သေး
+def pattern_predict(sequence=None, *, invert: bool = False) -> str | None:
+    """Pattern mode rule (အသစ်):
+    ကြီး ၁ခါ → ကြီး, ကြီး ၂ခါ → ကြီး, ကြီး ၃ခါ → သေး, ကြီး ၄ခါနှင့်အထက် → ကြီး
+    သေး ၁ခါ → သေး, သေး ၂ခါ → သေး, သေး ၃ခါ → ကြီး, သေး ၄ခါနှင့်အထက် → သေး
+    SBSB → ကြီး, BSBS → ကြီး
     """
     seq = _pattern_sequence(sequence, invert=invert)
     last, count = _last_side_streak(seq)
     if not last:
         return None
-    # SB / BS — နောက်ဆုံး ၂ ခု အပြောင်းအလဲ ဆိုရင် အမြဲ သေး
-    if count == 1:
-        return "SMALL"
+    # နောက်ဆုံး ၄ ခုက အလ alternating (SBSB / BSBS) ဆိုရင် ကြီး
+    if len(seq) >= 4:
+        tail4 = seq[-4:]
+        if tail4 in (["SMALL", "BIG", "SMALL", "BIG"],
+                     ["BIG", "SMALL", "BIG", "SMALL"]):
+            return "BIG"
     if last == "BIG":
-        return "BIG" if count == 3 else "SMALL"
+        return "SMALL" if count == 3 else "BIG"
     # SMALL side
-    return "SMALL" if count == 3 else "BIG"
-
-
-def pattern_predict(sequence=None, *, invert: bool = False) -> str | None:
-    """Pattern rule ရလဒ်ကို တိုက်ရိုက် ပြန်ပေးပါတယ်။"""
-    return _pattern_predict_raw(sequence, invert=invert)
+    return "BIG" if count == 3 else "SMALL"
 
 
 def load_win_stickers() -> list:
@@ -848,9 +846,11 @@ def _next_signal_mode() -> str:
         state = json.loads(TURN_STATE_FILE.read_text()) if TURN_STATE_FILE.exists() else {}
     except Exception:
         state = {}
-    mode = state.get("next_mode", "reverse")
+    # ပုံမှန် flow: ဒဲ့ (source) တစ်ခါ → ကန့် (reverse) တစ်ခါ ... ဆက်တိုက်။
+    # win/loss ဘယ်လိုဖြစ်ဖြစ် ဒီအလှည့်ကို reset မလုပ်ပါ။
+    mode = state.get("next_mode", "source")
     if mode not in {"reverse", "source"}:
-        mode = "reverse"
+        mode = "source"
     temp = TURN_STATE_FILE.with_suffix(".tmp")
     temp.write_text(json.dumps({"next_mode": "source" if mode == "reverse" else "reverse"}))
     temp.replace(TURN_STATE_FILE)
@@ -1740,9 +1740,6 @@ async def _settle_auto_pending(bot, config: dict, channel_level: int | None) -> 
     save_channel_config(config)
 
     if our_won:
-        # Win ဖြစ်တာနဲ့ flow အစ (ဒဲ့တစ်ခါ → ကန့်တစ်ခါ) ကို ချက်ချင်း ပြန်သွားပါတယ်။
-        config["auto_next_mode"] = "source"
-        save_channel_config(config)
         streak = mm_register_win()
         file_id = sticker_for_streak(streak)
         if file_id:
@@ -1783,19 +1780,6 @@ async def _send_auto_intro(bot, targets) -> None:
             )
         except Exception as error:
             logger.warning("Auto intro post failed for %s: %s", chat_id, error)
-
-
-def _auto_next_mode(config: dict) -> str:
-    """Auto post ရဲ့ သီးသန့် turn state — ဒဲ့ (source) တစ်ခါ၊ ကန့် (reverse) တစ်ခါ။
-
-    Manual signal တွေက ဒီ turn ကို မထိပါဘူး။ Win တာနဲ့ "source" ကို ပြန်ရောက်ပါတယ်။
-    """
-    mode = config.get("auto_next_mode")
-    if mode not in {"source", "reverse"}:
-        mode = "source"
-    config["auto_next_mode"] = "reverse" if mode == "source" else "source"
-    save_channel_config(config)
-    return mode
 
 
 async def auto_post_job(context: ContextTypes.DEFAULT_TYPE):
@@ -1857,8 +1841,7 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE):
         logger.info("Pattern mode (%s loss streak) → %s", mm_loss_streak(), output)
     else:
         # Consume one turn only for a genuinely new source post.
-        mode = _auto_next_mode(config)
-        config = load_channel_config()
+        mode = _next_signal_mode()
         output = (
             ("SMALL" if source_signal == "BIG" else "BIG")
             if mode == "reverse" else source_signal
@@ -2504,9 +2487,6 @@ async def _handle_admin_cb(q, ctx: ContextTypes.DEFAULT_TYPE, data: str):
         config["auto_post"] = not config.get("auto_post", False)
         # Auto post ကို အသစ်ပြန်ဖွင့်တိုင်း intro ပုံကို တစ်ကြိမ် ပြန်တင်ပါတယ်။
         config["auto_intro_sent"] = False
-        if config["auto_post"]:
-            # Session အသစ် — ဒဲ့ (source) ကနေ ပြန်စပါတယ်။
-            config["auto_next_mode"] = "source"
         save_channel_config(config)
         await q.edit_message_text(
             admin_panel_text(), parse_mode=ParseMode.MARKDOWN, reply_markup=kb_admin()
@@ -2594,27 +2574,98 @@ async def _do_add_forwarded_channel(update: Update, ctx: ContextTypes.DEFAULT_TY
     return True
 
 async def _do_add_vip(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str):
+    """Add / extend a VIP member manually.
+
+    Accepts flexible input, e.g.:
+        123456789 30
+        123456789,30
+        123456789 30 days
+        123456789   30d
+        123456789          (days မထည့်ရင် lifetime)
+    """
     ctx.user_data["state"] = None
-    parts = text.strip().split()
-    if len(parts) != 2:
-        await update.message.reply_text("❌ Format: `USER_ID DAYS`", parse_mode=ParseMode.MARKDOWN); return
-    try:
-        uid = str(int(parts[0])); days = int(parts[1])
-    except ValueError:
-        await update.message.reply_text("❌ ဂဏန်းဖြစ်ရပါမည်"); return
-    expiry     = None if days == 0 else (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
+    raw = (text or "").replace(",", " ").replace("\n", " ").strip()
+    parts = [p for p in raw.split() if p.strip()]
+    if not parts:
+        await update.message.reply_text(
+            "❌ Format: `USER_ID DAYS`\nExample: `123456789 30`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    def _digits(value: str) -> str:
+        return "".join(ch for ch in value if ch.isdigit())
+
+    uid_raw = _digits(parts[0])
+    if not uid_raw:
+        await update.message.reply_text("❌ User ID က ဂဏန်းဖြစ်ရပါမည်\nExample: `123456789 30`",
+                                        parse_mode=ParseMode.MARKDOWN)
+        return
+
+    days = 0
+    if len(parts) > 1:
+        day_raw = ""
+        for token in parts[1:]:
+            day_raw = _digits(token)
+            if day_raw:
+                break
+        if not day_raw:
+            await update.message.reply_text("❌ DAYS က ဂဏန်းဖြစ်ရပါမည် (0 = Lifetime)")
+            return
+        try:
+            days = int(day_raw)
+        except ValueError:
+            await update.message.reply_text("❌ DAYS က ဂဏန်းဖြစ်ရပါမည် (0 = Lifetime)")
+            return
+        if days < 0 or days > 36500:
+            await update.message.reply_text("❌ DAYS က 0 မှ 36500 အတွင်း ဖြစ်ရပါမည်")
+            return
+
+    uid = str(int(uid_raw))
+    vip = load_vip()
+    existing = vip.get(uid) if isinstance(vip.get(uid), dict) else {}
+
+    if days == 0:
+        expiry = None
+    else:
+        # Extend an active membership instead of shortening it.
+        start = datetime.now(timezone.utc)
+        old_expiry = existing.get("expiry") if existing else None
+        if old_expiry:
+            try:
+                old_dt = datetime.fromisoformat(old_expiry)
+                if old_dt.tzinfo is None:
+                    old_dt = old_dt.replace(tzinfo=timezone.utc)
+                if old_dt > start:
+                    start = old_dt
+            except Exception:
+                pass
+        expiry = (start + timedelta(days=days)).isoformat()
+
     expiry_str = "♾ Lifetime" if expiry is None else expiry[:10]
     try:
         chat = await ctx.bot.get_chat(int(uid))
         first_name = chat.first_name or ""; username = chat.username or ""
     except Exception:
-        first_name = "Unknown"; username = ""
-    vip = load_vip()
+        first_name = (existing.get("first_name") if existing else "") or "Unknown"
+        username = (existing.get("username") if existing else "") or ""
+
     vip[uid] = {"first_name": first_name, "username": username, "expiry": expiry,
                 "added_by": update.effective_user.id, "added_at": datetime.now(timezone.utc).isoformat()}
-    save_vip(vip)
+    try:
+        save_vip(vip)
+    except Exception as e:
+        logger.exception("Could not save VIP data: %s", e)
+        await update.message.reply_text(f"❌ VIP သိမ်းဆည်းမရပါ: {e}")
+        return
+
+    if not is_vip(int(uid)):
+        await update.message.reply_text("❌ VIP ထည့်တာ မအောင်မြင်ပါ။ ထပ်စမ်းပါ။")
+        return
+
     await update.message.reply_text(
-        f"✅ *VIP Added!*\n\n👤 ID: `{uid}`\n📛 Name: {first_name}\n📅 Expiry: {expiry_str}",
+        f"✅ *VIP Added!*\n\n👤 ID: `{uid}`\n📛 Name: {first_name}\n"
+        f"📅 Days: {'Lifetime' if days == 0 else days}\n📅 Expiry: {expiry_str}",
         parse_mode=ParseMode.MARKDOWN,
     )
     try:
