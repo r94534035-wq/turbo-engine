@@ -577,11 +577,11 @@ def pause_remaining_seconds() -> int:
 
 
 def mm_force_resume() -> dict:
-    """Admin: ရပ်ထားချိန်မပြည့်လည်း ချက်ချင်း ပြန်ဖွင့် (cycle အသစ် စ)။"""
+    """Admin: schedule ပြင်ပဖြစ်လည်း Pause Now နှိပ်သည်အထိ ချက်ချင်း run ပါ။"""
     state = load_mm_state()
     state = _start_new_cycle(state, datetime.now(timezone.utc))
     state["manual_pause"] = False
-    state["manual_resume"] = False
+    state["manual_resume"] = True
     save_mm_state(state)
     return state
 
@@ -854,6 +854,20 @@ def _next_signal_mode() -> str:
     temp = TURN_STATE_FILE.with_suffix(".tmp")
     temp.write_text(json.dumps({"next_mode": "source" if mode == "reverse" else "reverse"}))
     temp.replace(TURN_STATE_FILE)
+    return mode
+
+
+def _next_auto_signal_mode(config: dict) -> str:
+    """Consume the auto-post turn without letting manual signals change it.
+
+    Normal recovery always alternates source/direct → reverse → source/direct.
+    Pattern signals do not consume this turn, so after pattern mode wins the
+    normal flow resumes opposite the last normal signal that was sent.
+    """
+    mode = config.get("auto_next_mode", "source")
+    if mode not in {"reverse", "source"}:
+        mode = "source"
+    config["auto_next_mode"] = "source" if mode == "reverse" else "reverse"
     return mode
 
 
@@ -1790,7 +1804,8 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE):
 
     # 30 win ပြည့်ပြီး ခဏရပ်ထားချိန်၊ သို့မဟုတ် သတ်မှတ်ထားတဲ့ daily
     # schedule ပြင်ပမှာ signal မပို့ပါ။
-    if signals_paused() or not schedule_is_open():
+    force_running = bool(load_mm_state().get("manual_resume"))
+    if signals_paused() or (not force_running and not schedule_is_open()):
         return
 
     source_signal = await fetch_latest_public_channel_signal()
@@ -1824,7 +1839,8 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE):
 
     # Win 30 ရောက်သွားရင် အဲဒီ post အပြီး နောက် signal မပို့ရပါ။
     # ဒီ re-check မရှိရင် settle လုပ်ပြီးတဲ့အချိန်မှာ signal တစ်ခု ပိုပို့သွားပါတယ်။
-    if signals_paused() or not schedule_is_open():
+    force_running = bool(load_mm_state().get("manual_resume"))
+    if signals_paused() or (not force_running and not schedule_is_open()):
         return
 
     # 3 ခါ ဆက်တိုက် ရှုံးရင် (3x) ပုံမှန် reverse/source turn ကို ခဏပြောင်းပြီး
@@ -1840,8 +1856,9 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE):
         mode = "source" if output == source_signal else "reverse"
         logger.info("Pattern mode (%s loss streak) → %s", mm_loss_streak(), output)
     else:
-        # Consume one turn only for a genuinely new source post.
-        mode = _next_signal_mode()
+        # Consume one AUTO turn only for a genuinely new source post.
+        # Manual VIP requests use their own turn and cannot disturb D → R → D.
+        mode = _next_auto_signal_mode(config)
         output = (
             ("SMALL" if source_signal == "BIG" else "BIG")
             if mode == "reverse" else source_signal
@@ -2484,7 +2501,11 @@ async def _handle_admin_cb(q, ctx: ContextTypes.DEFAULT_TYPE, data: str):
         if not config.get("channels"):
             await q.answer("အရင်ဆုံး Add Channel လုပ်ပါ။", show_alert=True)
             return
-        config["auto_post"] = not config.get("auto_post", False)
+        turning_on = not config.get("auto_post", False)
+        config["auto_post"] = turning_on
+        # Auto post session အသစ်တိုင်း ပထမ signal ကို ဒဲ့က စပါမယ်။
+        if turning_on:
+            config["auto_next_mode"] = "source"
         # Auto post ကို အသစ်ပြန်ဖွင့်တိုင်း intro ပုံကို တစ်ကြိမ် ပြန်တင်ပါတယ်။
         config["auto_intro_sent"] = False
         save_channel_config(config)
