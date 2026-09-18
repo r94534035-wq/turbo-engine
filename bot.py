@@ -860,14 +860,21 @@ def _next_signal_mode() -> str:
 def _next_auto_signal_mode(config: dict) -> str:
     """Consume the auto-post turn without letting manual signals change it.
 
-    Normal recovery always alternates source/direct → reverse → source/direct.
-    Pattern signals do not consume this turn, so after pattern mode wins the
-    normal flow resumes opposite the last normal signal that was sent.
+    Normal flow alternates ဒဲ့ (source) → ကန့် (reverse) → ဒဲ့ ...
+    Pattern rule အပြီး ပုံမှန် flow ပြန်စတဲ့အခါ ပထမ signal ကို
+    ရှေ့ပုံမှန် sequence ရဲ့ နောက်ဆုံး mode အတိုင်း ပြန်ပေးပါတယ်
+    (နောက်ဆုံး ဒဲ့ဆို ဒဲ့၊ နောက်ဆုံး ကန့်ဆို ကန့်)၊ ပြီးမှ ဆက်လဲပါတယ်။
     """
-    mode = config.get("auto_next_mode", "source")
-    if mode not in {"reverse", "source"}:
-        mode = "source"
+    last_normal = config.get("auto_last_normal_mode")
+    if config.get("auto_after_pattern") and last_normal in {"source", "reverse"}:
+        mode = last_normal
+    else:
+        mode = config.get("auto_next_mode", "source")
+        if mode not in {"reverse", "source"}:
+            mode = "source"
     config["auto_next_mode"] = "source" if mode == "reverse" else "reverse"
+    config["auto_last_normal_mode"] = mode
+    config["auto_after_pattern"] = False
     return mode
 
 
@@ -1854,6 +1861,8 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE):
     if pattern_output:
         output = pattern_output
         mode = "source" if output == source_signal else "reverse"
+        # Pattern အပြီး ပုံမှန် flow ပြန်စချိန်မှာ နောက်ဆုံး ပုံမှန် mode ကို ပြန်ပေးရန်။
+        config["auto_after_pattern"] = True
         logger.info("Pattern mode (%s loss streak) → %s", mm_loss_streak(), output)
     else:
         # Consume one AUTO turn only for a genuinely new source post.
@@ -2506,6 +2515,8 @@ async def _handle_admin_cb(q, ctx: ContextTypes.DEFAULT_TYPE, data: str):
         # Auto post session အသစ်တိုင်း ပထမ signal ကို ဒဲ့က စပါမယ်။
         if turning_on:
             config["auto_next_mode"] = "source"
+            config["auto_last_normal_mode"] = None
+            config["auto_after_pattern"] = False
         # Auto post ကို အသစ်ပြန်ဖွင့်တိုင်း intro ပုံကို တစ်ကြိမ် ပြန်တင်ပါတယ်။
         config["auto_intro_sent"] = False
         save_channel_config(config)
